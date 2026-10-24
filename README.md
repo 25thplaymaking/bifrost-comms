@@ -5,7 +5,7 @@
 <p align="center"><b>Get your Arma Reforger players on Coalition VON with one download.</b><br>
 TeamSpeak 3, the Coalition plugin, your server and the game, set up and launched from one small Windows program.</p>
 
-<p align="center"><a href="../../releases/latest"><b>Download the latest release</b></a></p>
+<p align="center"><a href="https://github.com/25thplaymaking/bifrost-comms/releases/latest"><b>Download the latest release</b></a></p>
 
 ---
 
@@ -34,7 +34,7 @@ Bifrost Comms does all of it for them. You hand your players one zip. They doubl
 
 ## Set it up for your unit (about two minutes)
 
-1. Download **`BifrostComms.exe`** and **`comms.json`** from the [latest release](../../releases/latest).
+1. Download **`BifrostComms.exe`** and **`comms.json`** from the [latest release](https://github.com/25thplaymaking/bifrost-comms/releases/latest).
 2. Open `comms.json` in Notepad and fill in your TeamSpeak server:
 
    ```json
