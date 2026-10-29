@@ -59,7 +59,7 @@ class TerminalForm : Form, IConsole {
     try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch (Exception) { }
     using (var g = Graphics.FromHwnd(IntPtr.Zero)) S = g.DpiX / 96f;
     ClientSize = Size.Round(new SizeF(1040 * S, 680 * S));
-    MinimumSize = Size.Round(new SizeF(880 * S, 580 * S));
+    MinimumSize = Size.Round(new SizeF(1000 * S, 580 * S));
     frame.Interval = 16;
     frame.Tick += delegate { Animate(); };
     Boot();
@@ -109,7 +109,11 @@ class TerminalForm : Form, IConsole {
     monitor = new Thread(delegate() {
       while (!closing) {
         Thread.Sleep(2000);
-        if (!closing && booted && !core.Busy) try { core.Tick(); } catch (Exception) { }
+        if (!closing && booted && !core.Busy) try {
+          core.Tick();
+          string why = core.TakePendingCheck();
+          if (why != null) BeginInvokeSafe(delegate { Run(delegate { core.RadioCheck(why); }); });
+        } catch (Exception) { }
       }
     }) { IsBackground = true, Name = "monitor" };
     monitor.Start();
@@ -588,14 +592,17 @@ class TerminalForm : Form, IConsole {
     }
 
     bool idle = !core.Busy && booted;
-    float launchW = 300 * S;
+    float launchW = 290 * S;
     Button(g, new RectangleF(x, y, launchW, bh), "launch", "▶  LAUNCH REFORGER + RADIO", true, idle, delegate { Run(core.Launch); });
     x += launchW + 12 * S;
-    float sw = 170 * S;
+    float sw = 166 * S;
     Button(g, new RectangleF(x, y, sw, bh), "setup", "SET UP / REPAIR", false, idle, delegate { Run(core.Setup); });
     x += sw + 10 * S;
-    float cw = 196 * S;
+    float cw = 190 * S;
     Button(g, new RectangleF(x, y, cw, bh), "connect", "CONNECT TEAMSPEAK", false, idle && core.Ts != null, delegate { Run(core.ConnectTeamSpeak); });
+    x += cw + 10 * S;
+    float rw = 150 * S;
+    Button(g, new RectangleF(x, y, rw, bh), "check", "RADIO CHECK", false, idle, delegate { Run(delegate { core.RadioCheck(null); }); });
     bool downloading;
     lock (gate) downloading = progLabel != null;
     if (core.Busy && downloading)

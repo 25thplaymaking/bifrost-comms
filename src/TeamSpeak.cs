@@ -7,6 +7,7 @@ using System.IO;
 using System.IO.Compression;
 using System.Net;
 using System.Net.Sockets;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 
@@ -20,7 +21,7 @@ class TsInstall {
   public string PluginsDir { get { return Path.Combine(ConfigDir, "plugins"); } }
 }
 
-class TsConnection { public int Handler; public string Ip, ChannelPath; public int Port; }
+class TsConnection { public int Handler; public string Ip, ChannelPath; public int Port; public bool Active; }   // Active: the selected tab
 
 static class TeamSpeak {
   public const string ProcessName = "ts3client_win64";
@@ -42,6 +43,21 @@ static class TeamSpeak {
     return null;
   }
 
+  // The install in dir (the running client's folder, say): the registry entry that names it gives its settings, else a
+  // config folder beside it means a portable install. Null when there's no client there.
+  public static TsInstall AtDir(Env env, string dir) {
+    foreach (var hive in new[] { "HKCU", "HKLM" }) {
+      string reg = env.ReadReg(hive, RegKey, "");
+      if (!string.IsNullOrEmpty(reg) && SamePath(reg.Trim().Trim('"'), dir))
+        return At(env, dir, env.ReadReg(hive, RegKey, "InstallMode"), env.ReadReg(hive, RegKey, "ConfigLocation"));
+    }
+    return At(env, dir, null, File.Exists(Path.Combine(dir, "config", "settings.db")) ? "1" : null);
+  }
+
+  static bool SamePath(string a, string b) {
+    try { return string.Equals(Path.GetFullPath(a).TrimEnd('\\', '/'), Path.GetFullPath(b).TrimEnd('\\', '/'), StringComparison.OrdinalIgnoreCase); } catch (Exception) { return false; }
+  }
+
   static TsInstall At(Env env, string dir, string mode, string configLocation) {
     string exe = Path.Combine(dir, ProcessName + ".exe");
     if (!File.Exists(exe)) return null;
@@ -59,6 +75,31 @@ static class TeamSpeak {
   }
 
   public static Process[] Running() { return Process.GetProcessesByName(ProcessName); }
+
+  // The folder the running client was started from (the first one), or null. A player can have a second TeamSpeak 3 (a
+  // portable copy, an old install) that isn't the one SET UP put the plugin into.
+  public static string RunningDir() {
+    string dir = null;
+    foreach (var p in Running()) {
+      try { if (dir == null) { string exe = ProcessPath(p.Id); if (exe != null) dir = Path.GetDirectoryName(exe); } } catch (Exception) { } finally { p.Dispose(); }
+    }
+    return dir;
+  }
+
+  [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr OpenProcess(uint access, bool inherit, int pid);
+  [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern bool QueryFullProcessImageName(IntPtr process, int flags, StringBuilder name, ref int size);
+  [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
+
+  // PROCESS_QUERY_LIMITED_INFORMATION: allowed without administrator rights, even for a client started elevated.
+  public static string ProcessPath(int pid) {
+    IntPtr h = OpenProcess(0x1000, false, pid);
+    if (h == IntPtr.Zero) return null;
+    try {
+      var sb = new StringBuilder(1024);
+      int size = sb.Capacity;
+      return QueryFullProcessImageName(h, 0, sb, ref size) ? sb.ToString(0, size) : null;
+    } finally { CloseHandle(h); }
+  }
 
   // ---------------------------------------------------------------------------------------------- installing the client
 
@@ -220,6 +261,9 @@ static class TeamSpeak {
         var q = new QueryLines(tcp.GetStream());
         q.SkipBanner();
         if (q.Command("auth apikey=" + key) == null) return null;
+        var current = q.Command("currentschandlerid");   // the tab selected in TeamSpeak's window: the only one the plugin serves
+        int active = 0;
+        if (current != null && current.Count > 0) int.TryParse(Get(current[0], "schandlerid"), out active);
         var handlers = q.Command("serverconnectionhandlerlist");
         if (handlers == null) return null;
         var list = new List<TsConnection>();
@@ -230,7 +274,7 @@ static class TeamSpeak {
           var info = q.Command("serverconnectinfo");   // error 1794 "not connected" on an empty tab
           if (info == null || info.Count == 0) continue;
           int serverPort; int.TryParse(Get(info[0], "port"), out serverPort);
-          var c = new TsConnection { Handler = id, Ip = Get(info[0], "ip"), Port = serverPort };
+          var c = new TsConnection { Handler = id, Ip = Get(info[0], "ip"), Port = serverPort, Active = id == active };
           var chan = q.Command("channelconnectinfo");
           if (chan != null && chan.Count > 0) c.ChannelPath = Get(chan[0], "path");
           list.Add(c);

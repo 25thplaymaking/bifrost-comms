@@ -26,6 +26,8 @@ interface IConsole {
 // Where things are on this PC. The tests point it at a sandbox folder and a dictionary instead of the registry.
 class Env {
   public string AppData, LocalAppData, Documents, Temp, Desktop, StartMenu, ProgramFiles, ProgramFilesX86;
+  public string SystemDir;          // 64-bit Windows\System32, where the Visual C++ runtime goes (null: don't check)
+  public string[] OtherDocuments;   // Documents folders besides the known one (under the user folder, OneDrive's) for RADIO CHECK
   public Func<string, string, string, string> Reg;   // hive ("HKCU"/"HKLM"), key, value name ("" = default) -> value or null
 
   public string Home { get { return Path.Combine(LocalAppData, "Bifrost Comms"); } }
@@ -50,8 +52,22 @@ class Env {
       StartMenu = Environment.GetFolderPath(Environment.SpecialFolder.Programs),
       ProgramFiles = Environment.GetEnvironmentVariable("ProgramW6432") ?? Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
       ProgramFilesX86 = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86),
+      SystemDir = Environment.Is64BitOperatingSystem && !Environment.Is64BitProcess
+        ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "Sysnative") : Environment.SystemDirectory,
+      OtherDocuments = OtherDocumentFolders(),
       Reg = RealRegistry,
     };
+  }
+
+  static string[] OtherDocumentFolders() {
+    var list = new List<string>();
+    foreach (var v in new[] { "USERPROFILE", "OneDrive", "OneDriveConsumer", "OneDriveCommercial" }) {
+      string root = Environment.GetEnvironmentVariable(v);
+      if (string.IsNullOrEmpty(root)) continue;
+      string d = Path.Combine(root, "Documents");
+      if (Directory.Exists(d) && !list.Contains(d)) list.Add(d);
+    }
+    return list.ToArray();
   }
 
   // TeamSpeak's installer writes the 64-bit view (SetRegView 64), so read that one whatever this process is.
@@ -135,11 +151,19 @@ class Comms {
   public TsInstall Ts;
   public volatile bool Cancel, Busy;
   public bool NoGame { get; set; }   // --no-game, for testing: never start Steam
-  Link lastLink = Link.Off;
+  string lastLinkLine;
   bool lastGame, lastPluginFresh, pluginEverFresh;
   DateTime lastQuery = DateTime.MinValue;
   List<TsConnection> lastConnections;
   string[] hostIps = new string[0]; string hostIpsFor; DateTime hostIpsAt;
+  // The automatic RADIO CHECK: what's stuck, since when, and whether it already ran for it (once each time).
+  string stuck, pendingCheck;
+  DateTime stuckSince;
+  bool stuckChecked;
+  // The running game's profile folder when -profile moves it (read once per game start), and a link LAUNCH was told not to make.
+  string gameProfile, declinedProfile;
+  bool gameProfileRead;
+  int gameProfileTries;
 
   public Comms(Env env, string exe, string version) {
     Env = env; Exe = exe; Version = version;
@@ -165,6 +189,11 @@ class Comms {
     if (!RunningFromHome) return InstallHome(launch);
     if (SelfUpdate(launch)) return false;
     Detect(true);
+    string moved = SteamConfig.LaunchProfile(Env, M.SteamAppId);
+    if (moved != null) {
+      bool linked = Doctor.SameDir(moved, Env.ProfileDir);
+      Say("reforger profile (steam -profile): " + moved + (linked ? " ........ LINKED" : ": the radio plugin doesn't look there; LAUNCH links them"), linked ? Tone.Ok : Tone.Warn);
+    }
     if (string.IsNullOrEmpty(M.Host)) Say("no TeamSpeak server yet: SET UP asks for the address your unit gave you", Tone.Accent);
     else Say("teamspeak server " + M.Host + ":" + M.Port + (M.ServerName != M.Host ? " (" + M.ServerName + ")" : ""), Tone.Dim);
     Say(Settings.Callsign == null ? "no callsign yet: you'll be asked the first time TeamSpeak connects" : "callsign " + Settings.Callsign, Settings.Callsign == null ? Tone.Accent : Tone.Dim);
@@ -454,15 +483,20 @@ class Comms {
     return true;
   }
 
-  bool CloseTeamSpeak() {
-    string a = Out == null ? null : Out.Ask("TeamSpeak is open and holds the old plugin. Close TeamSpeak to update it?", "CLOSE TEAMSPEAK", "NOT NOW");
-    if (a != "CLOSE TEAMSPEAK") return false;
+  // question: asked first; null when the player already said yes (a RADIO CHECK fix button).
+  bool CloseTeamSpeak(string question = "TeamSpeak is open and holds the old plugin. Close TeamSpeak to update it?") {
+    if (TeamSpeak.Running().Length == 0) return true;
+    if (question != null) {
+      string a = Out == null ? null : Out.Ask(question, "CLOSE TEAMSPEAK", "NOT NOW");
+      if (a != "CLOSE TEAMSPEAK") return false;
+    }
+    if (Out == null) return false;
     foreach (var p in TeamSpeak.Running()) { try { p.CloseMainWindow(); } catch (Exception) { } p.Dispose(); }
     for (int i = 0; i < 40; i++) { if (TeamSpeak.Running().Length == 0) return true; Thread.Sleep(250); }
-    a = Out.Ask("TeamSpeak is still running (it may be in the tray). Quit it from its tray icon, or force it closed?", "FORCE CLOSE", "I QUIT IT", "NOT NOW");
-    if (a == "FORCE CLOSE") {
+    string b = Out.Ask("TeamSpeak is still running (it may be in the tray). Quit it from its tray icon, or force it closed?", "FORCE CLOSE", "I QUIT IT", "NOT NOW");
+    if (b == "FORCE CLOSE") {
       foreach (var p in TeamSpeak.Running()) { try { p.Kill(); p.WaitForExit(5000); } catch (Exception) { } p.Dispose(); }
-    } else if (a == "I QUIT IT") {
+    } else if (b == "I QUIT IT") {
       for (int i = 0; i < 40 && TeamSpeak.Running().Length > 0; i++) Thread.Sleep(250);
     }
     return TeamSpeak.Running().Length == 0;
@@ -489,6 +523,7 @@ class Comms {
     if (!EnsureCallsign(false)) { Say("launch needs a callsign", Tone.Bad); return; }
     Detect(false);
     if (Ts == null) { Say("TeamSpeak 3 isn't installed yet: setting up first", Tone.Warn); Setup(); if (Ts == null) return; }
+    LinkProfileBeforeLaunch();
     bool tsRunning = TeamSpeak.Running().Length > 0;
     if (!PluginCurrent()) InstallPlugin(tsRunning);   // before TeamSpeak starts, an update needs no closing
     tsRunning = TeamSpeak.Running().Length > 0;
@@ -519,7 +554,7 @@ class Comms {
     }
     var info = new Bridge(Env.ProfileDir).Plugin();
     if (fresh) Say("radio plugin " + info.Version + " online [" + info.Features + "] ........ OK", Tone.Ok);
-    else Say("the radio plugin hasn't reported in. In TeamSpeak: Tools > Options > Addons > Plugins, tick \"" + M.PluginName + "\".", Tone.Warn);
+    else Say("the radio plugin hasn't reported in: RADIO CHECK finds out why (it runs by itself if it stays quiet)", Tone.Warn);
     if (connectSent) WaitForConnection();
     Detect(false);
 
@@ -532,6 +567,26 @@ class Comms {
       } catch (Exception e) { Say("couldn't open Steam (" + Short(e) + "): start Arma Reforger yourself; the radio works the same.", Tone.Warn); }
     }
     Say("join a server that runs Coalition VON: the radio links when you spawn in. Keep this window open to watch the link.", Tone.Text);
+  }
+
+  // Steam starting Reforger with -profile puts its radio files where the plugin never looks: offered before anything
+  // starts, so the link needs no TeamSpeak restart. A game that's already running is the watch's to check (Tick).
+  public void LinkProfileBeforeLaunch() {
+    if (GameRunning()) return;
+    string dir = SteamConfig.LaunchProfile(Env, M.SteamAppId);
+    if (dir == null || Doctor.SameDir(dir, Env.ProfileDir)) return;
+    var x = Doctor.LinkProfile("Steam starts Reforger with -profile, so it keeps its radio files in " + dir + ", but the Coalition plugin only looks in " + Env.ProfileDir + ".", dir);
+    Say(x.Problem, Tone.Warn);
+    Say("  " + x.Advice, Tone.Text);
+    if (Out == null || Out.Ask(x.Question, x.FixLabel, "NOT NOW") != x.FixLabel) {
+      declinedProfile = dir;
+      Say("not linked: the radio can't link until it is (RADIO CHECK offers it again)", Tone.Warn);
+      return;
+    }
+    try {
+      Directory.CreateDirectory(dir);   // Reforger makes it on its first start with -profile; made now so the link has somewhere to point
+      LinkProfileFolders(dir, false);   // LAUNCH starts and connects TeamSpeak next
+    } catch (Exception e) { Say("couldn't link the folders: " + Short(e), Tone.Bad); }
   }
 
   // Up to 30 s for TeamSpeak to show up on the unit's server (ClientQuery); says what to do when it doesn't.
@@ -590,6 +645,8 @@ class Comms {
     bool pluginFresh = Bridge.Fresh(bridge.Plugin(), now);
     bool game = GameRunning();
     var sd = bridge.Server();
+    string elsewhere = game ? GameProfileElsewhere() : null;
+    if (!game) { gameProfile = null; gameProfileRead = false; gameProfileTries = 0; }
 
     string channel = null;
     if (tsRunning && Ts != null) {
@@ -606,7 +663,9 @@ class Comms {
       lock (Lock) { St.TsLink = "OFFLINE"; St.TsLinkDetail = "TeamSpeak isn't running"; St.TsLinkTone = Tone.Dim; }
     }
 
-    var link = Bridge.Derive(game, tsRunning, pluginFresh, sd, bridge.HeartbeatAge(now), channel);
+    double heartbeat = bridge.HeartbeatAge(now);
+    bool offUnit = tsRunning && Ts != null && !string.IsNullOrEmpty(M.Host) && lastConnections != null && ConnectedToUnit(lastConnections) == null;
+    var link = Bridge.Derive(game, tsRunning, pluginFresh, sd, heartbeat, channel, offUnit, elsewhere);
     lock (Lock) {
       St.Link = link;
       St.Game = game ? "RUNNING" : "NOT RUNNING"; St.GameTone = game ? Tone.Ok : Tone.Dim;
@@ -615,11 +674,134 @@ class Comms {
     if (pluginFresh) pluginEverFresh = true;
     if (pluginFresh != lastPluginFresh && pluginEverFresh) Say(pluginFresh ? "radio plugin online" : "radio plugin went quiet (TeamSpeak closed?)", pluginFresh ? Tone.Ok : Tone.Warn);
     if (game != lastGame) Say(game ? "arma reforger started" : "arma reforger closed. Radio link down.", game ? Tone.Ok : Tone.Dim);
-    if (link.Link != lastLink && link.Link != Link.Off) Say("radio link: " + link.Text + " - " + link.Detail, link.Tone);
-    lastLink = link.Link; lastGame = game; lastPluginFresh = pluginFresh;
+    string linkLine = "radio link: " + link.Text + " - " + link.Detail;
+    if (linkLine != lastLinkLine && link.Link != Link.Off) Say(linkLine, link.Tone);
+    lastLinkLine = linkLine; lastGame = game; lastPluginFresh = pluginFresh;
+    WatchForStuck(link, tsRunning, pluginFresh, Doctor.HeartbeatFresh(heartbeat), elsewhere != null && Doctor.SameDir(elsewhere, declinedProfile), DateTime.Now);
     PluginStatus(false);
     Changed();
   }
+
+  // The folder the running game keeps its radio files in when it isn't the plugin's (null: it is). The game's command
+  // line is read when it starts (a few tries while Windows won't show it), then compared on every tick, so a link made
+  // meanwhile counts at once.
+  string GameProfileElsewhere() {
+    if (!gameProfileRead) {
+      bool running;
+      string options;
+      gameProfile = Doctor.GameProfile(Env, M, out running, out options);
+      gameProfileRead = options != null || ++gameProfileTries >= 3;
+    }
+    return gameProfile != null && !Doctor.SameDir(gameProfile, Env.ProfileDir) ? gameProfile : null;
+  }
+
+  // When the link stays stuck, RADIO CHECK runs by itself, once for each time it gets stuck: the window picks it up
+  // (TakePendingCheck) and runs it as a job, so its fix questions show like any other. Waits are long enough that normal
+  // steps (loading in, the respawn screen, the plugin's move) don't trigger it; a moved profile folder can't fix itself,
+  // so it doesn't wait (unless LAUNCH already asked). at: the time now (the tests pass their own).
+  public void WatchForStuck(LinkState link, bool tsRunning, bool pluginFresh, bool onRadioServer, bool splitDeclined, DateTime at) {
+    string now = null;
+    int wait = 0;
+    bool pluginInstalled = Ts != null && TeamSpeak.InstalledPluginHash(Ts, M.PluginDll) != null;
+    if (link.Link == Link.Split) now = splitDeclined ? null : "Reforger keeps its radio files in another folder";
+    else if (link.Link == Link.NoPlugin || (link.Link == Link.Off && tsRunning && pluginInstalled && !pluginFresh)) { now = "the radio plugin isn't loaded"; wait = 45; }
+    else if (link.Link == Link.Standby && onRadioServer) { now = "you haven't spawned in"; wait = 150; }
+    else if (link.Link == Link.Standby) { now = "no radio signal from the game"; wait = 180; }
+    else if (link.Link == Link.Joining || link.Link == Link.OffServer) { now = "teamspeak hasn't linked the radio"; wait = 30; }
+    if (now != stuck) { stuck = now; stuckSince = at; stuckChecked = false; return; }
+    if (now == null || stuckChecked || (at - stuckSince).TotalSeconds < wait) return;
+    stuckChecked = true;
+    lock (Lock) pendingCheck = now;
+  }
+
+  // The automatic RADIO CHECK waiting to run (its reason), once.
+  public string TakePendingCheck() {
+    lock (Lock) { string p = pendingCheck; pendingCheck = null; return p; }
+  }
+
+  // ---------------------------------------------------------------------------------------------- radio check
+
+  // Everything between the game and TeamSpeak on this PC (Doctor), with a fix button for each problem it can fix itself.
+  // why: the automatic run's reason (prints only what's wrong); null for the RADIO CHECK button (prints all it saw too,
+  // for COPY LOG).
+  public void RadioCheck(string why) {
+    Say(why == null ? "=== RADIO CHECK ===" : "=== RADIO CHECK: " + why + " ===", Tone.Accent);
+    Detect(false);
+    var facts = Doctor.Gather(this);
+    if (why == null) foreach (var l in Doctor.Report(facts, M)) Say(l.Key, l.Value);
+    var found = Doctor.Diagnose(facts, M);
+    int problems = 0, fixedCount = 0;
+    foreach (var x in found) {
+      if (x.Tone == Tone.Bad) problems++;
+      Say((x.Tone == Tone.Bad ? "PROBLEM: " : "") + x.Problem, x.Tone);
+      if (!string.IsNullOrEmpty(x.Advice)) Say("  " + x.Advice, Tone.Text);
+      if (x.Fix == Fix.None || Out == null) continue;
+      string a = Out.Ask(x.Question ?? "Fix it now?", x.FixLabel, "NOT NOW");
+      if (a != x.FixLabel) { Say("left as it is: press RADIO CHECK when you want the fix", Tone.Dim); continue; }
+      if (ApplyFix(x)) fixedCount++;
+    }
+    if (found.Count == 0)
+      Say(why == null ? "radio check: everything on this PC looks right. If the radio still fails, press COPY LOG and send it to your unit's admins."
+                      : "radio check: nothing wrong on this PC", Tone.Ok);
+    else if (problems > 0)
+      Say("radio check: " + problems + (problems == 1 ? " problem, " : " problems, ") + fixedCount + " fixed" +
+          (fixedCount < problems ? ". Stuck? Press COPY LOG and send it to your unit's admins." : ". Watch the RADIO LINK light."), fixedCount < problems ? Tone.Warn : Tone.Ok);
+    Detect(false);
+  }
+
+  // True when the problem is gone; the guided ones (a download, a Windows page) say what to do and return false.
+  bool ApplyFix(Finding x) {
+    try {
+      switch (x.Fix) {
+        case Fix.LinkProfile:
+          return LinkProfileFolders(x.Target, true);
+        case Fix.PluginIntoRunningTs: {
+          var other = TeamSpeak.AtDir(Env, x.Target);
+          if (other == null) { Say("no TeamSpeak 3 in " + x.Target, Tone.Bad); return false; }
+          if (!CloseTeamSpeak(null)) { Say("not installed: TeamSpeak is still open", Tone.Warn); return false; }
+          Ts = other;
+          if (!InstallPlugin(false)) return false;
+          ConnectTeamSpeak();
+          return true;
+        }
+        case Fix.UpdateTeamSpeak:
+          if (!CloseTeamSpeak(null)) { Say("not updated: TeamSpeak is still open", Tone.Warn); return false; }
+          if (!InstallTeamSpeak() || !InstallPlugin(false)) return false;
+          ConnectTeamSpeak();
+          return true;
+        case Fix.RestartTeamSpeak:
+          if (!CloseTeamSpeak(null)) { Say("TeamSpeak is still open: quit it from its tray icon, then LAUNCH", Tone.Warn); return false; }
+          ConnectTeamSpeak();
+          return true;
+        case Fix.VcRuntime:
+          Open(Doctor.VcRuntimeUrl);
+          Say("your browser is downloading vc_redist.x64.exe from Microsoft: run it, then RESTART TEAMSPEAK (RADIO CHECK offers it)", Tone.Accent);
+          return false;
+        case Fix.FolderAccess:
+          Open(Doctor.FolderAccessPage);
+          Say("Windows Security is open: Allow an app through Controlled folder access, add ArmaReforgerSteam.exe and ts3client_win64.exe", Tone.Accent);
+          return false;
+        case Fix.Connect:
+          ConnectTeamSpeak();
+          return true;
+      }
+    } catch (Exception e) { Say("fix failed: " + Short(e), Tone.Bad); }
+    return false;
+  }
+
+  // The plugin's folder opens the game's from now on. TeamSpeak closes first (its plugin writes in that folder);
+  // reconnect starts it again on the unit's server.
+  bool LinkProfileFolders(string target, bool reconnect) {
+    bool tsOpen = TeamSpeak.Running().Length > 0;
+    if (tsOpen && !CloseTeamSpeak(null)) { Say("not linked: TeamSpeak is still open", Tone.Warn); return false; }
+    string aside = Doctor.LinkFolders(Env.ProfileDir, target);
+    Say("linked: " + Env.ProfileDir + " now opens " + target + " ........ OK", Tone.Ok);
+    if (aside != null) Say("the folder that was there is kept as " + aside, Tone.Dim);
+    if (tsOpen && reconnect) ConnectTeamSpeak();
+    return true;
+  }
+
+  static void Open(string target) { Process.Start(new ProcessStartInfo(target) { UseShellExecute = true }); }
 
   // ---------------------------------------------------------------------------------------------- shortcuts, removal
 

@@ -22,14 +22,23 @@ static class CommsTests {
     try {
       Versions(); ManifestParsing(); SafePaths(); PluginInstall(); FindTeamSpeak(); Uris(); QueryText(); ClientQueryFake();
       BridgeFiles(); LinkStates(); SettingsFile(); UnitFile(); ServerPrompt(); ServerMatch(); Builds(); Downloads(); Overwolf(); Wrapping();
+      GameOptions(); SteamOptions(); Diagnoses(); RadioCheckRun(); StuckWatch(); PcChecks(); FolderLink(); LaunchLink();
       string renders = args.Length > 0 ? args[0] : Path.Combine("build", "renders");
       Renders(renders);
     } finally {
-      try { Directory.Delete(root, true); } catch (Exception) { }
+      try { RemoveLinks(root); Directory.Delete(root, true); } catch (Exception e) { Console.WriteLine("  (temp folder not fully removed: " + e.GetType().Name + ": " + e.Message + ")"); }
     }
     Console.WriteLine();
     Console.WriteLine(passed + " passed, " + failed + " failed");
     return failed == 0 ? 0 : 1;
+  }
+
+  // The folder links the checks make go first, on their own: a recursive delete over a junction is refused.
+  static void RemoveLinks(string dir) {
+    foreach (var d in Directory.GetDirectories(dir)) {
+      if (Doctor.IsLink(d)) Directory.Delete(d, false);
+      else RemoveLinks(d);
+    }
   }
 
   static void Check(string name, bool ok) {
@@ -265,6 +274,7 @@ static class CommsTests {
             if (cmd == "quit") break;
             if (cmd.StartsWith("auth ")) send(cmd == "auth apikey=KEY-1" ? "error id=0 msg=ok" : "error id=256 msg=invalid");
             else if (cmd == "serverconnectionhandlerlist") { send("schandlerid=1|schandlerid=2"); send("error id=0 msg=ok"); }
+            else if (cmd == "currentschandlerid") { send("schandlerid=2"); send("error id=0 msg=ok"); }
             else if (cmd.StartsWith("use ")) { handler = int.Parse(cmd.Substring(16)); send("error id=0 msg=ok"); }
             else if (cmd == "serverconnectinfo") {
               if (handler == 1) send("error id=1794 msg=not\\sconnected");
@@ -280,6 +290,7 @@ static class CommsTests {
     listener.Stop();
     Check("ClientQuery: one connected tab of two", conns != null && conns.Count == 1 && conns[0].Handler == 2 && conns[0].Ip == "203.0.113.10" && conns[0].Port == 9987);
     Check("ClientQuery: current channel", conns != null && conns.Count == 1 && conns[0].ChannelPath == "EXU/Reforger In-Game (VON)");
+    Check("ClientQuery: the selected tab is marked", conns != null && conns.Count == 1 && conns[0].Active);
     lock (seen) Check("ClientQuery: authenticated with the ini's key", seen.Count > 0 && seen[0] == "auth apikey=KEY-1");
     Check("ClientQuery: nothing listening = null", TeamSpeak.Connections(ts, port) == null);
   }
@@ -309,15 +320,25 @@ static class CommsTests {
   }
 
   static void LinkStates() {
-    var sd = new ServerData { InGame = true, ChannelName = "Reforger In-Game (VON)" };
+    var sd = new ServerData { InGame = true, ChannelName = "Reforger In-Game (VON)", ClientId = 7 };
     Check("link: game off", Bridge.Derive(false, true, true, sd, 0, null).Link == Link.Off);
     Check("link: no TeamSpeak", Bridge.Derive(true, false, false, sd, 0, null).Link == Link.NoTeamSpeak);
     Check("link: no plugin", Bridge.Derive(true, true, false, sd, 0, null).Link == Link.NoPlugin);
-    Check("link: standby in menus", Bridge.Derive(true, true, true, new ServerData { InGame = false }, -1, null).Link == Link.Standby);
+    var menus = Bridge.Derive(true, true, true, new ServerData { InGame = false }, -1, null);
+    Check("link: standby in menus", menus.Link == Link.Standby && menus.Detail.Contains("join a Coalition radio server"));
+    var waiting = Bridge.Derive(true, true, true, new ServerData { InGame = false }, 0.5, null);
+    Check("link: on a radio server, not spawned: says spawn in", waiting.Link == Link.Standby && waiting.Detail.Contains("spawn"));
+    var off = Bridge.Derive(true, true, true, sd, 1, null, true);
+    Check("link: TeamSpeak off the unit's server", off.Link == Link.OffServer && off.Tone == Tone.Warn && off.Detail.Contains("your unit's server"));
+    var noId = Bridge.Derive(true, true, true, new ServerData { InGame = true, ChannelName = "Reforger In-Game (VON)" }, 1, "EXU/Reforger In-Game (VON)");
+    Check("link: no TeamSpeak id from the plugin is not linked", noId.Link == Link.Joining && noId.Detail.Contains("plugin"));
     Check("link: heartbeat stopped", Bridge.Derive(true, true, true, sd, 12, "x").Link == Link.NoHeartbeat);
     Check("link: joining", Bridge.Derive(true, true, true, sd, 1, "EXU/Lobby").Link == Link.Joining);
     Check("link: linked in the VON channel", Bridge.Derive(true, true, true, sd, 1, "EXU/Reforger In-Game (VON)").Link == Link.Linked);
     Check("link: linked when the channel can't be seen", Bridge.Derive(true, true, true, sd, 1, null).Link == Link.Linked);
+    var split = Bridge.Derive(true, false, false, null, -1, null, false, "G:\\Arma\\profile");
+    Check("link: the game's radio files in another folder is down, whatever else", split.Link == Link.Split && split.Tone == Tone.Bad && split.Detail.Contains("G:\\Arma\\profile"));
+    Check("link: game off wins over the other folder", Bridge.Derive(false, true, true, sd, 0, null, false, "G:\\Arma\\profile").Link == Link.Off);
   }
 
   // ---------------------------------------------------------------------------------------------- settings, comms.json
@@ -555,6 +576,365 @@ static class CommsTests {
     Check("no wrapped line longer than the width", fits);
   }
 
+  // ---------------------------------------------------------------------------------------------- radio check
+
+  static void GameOptions() {
+    string docs = Path.Combine(root, "docs-x");
+    Check("options after a quoted program", Doctor.AfterProgram("\"C:\\Steam\\steamapps\\common\\Arma Reforger\\ArmaReforgerSteam.exe\" -window -profile x") == "-window -profile x");
+    Check("options after a plain program", Doctor.AfterProgram("ArmaReforgerSteam.exe -window") == "-window");
+    Check("no options", Doctor.AfterProgram("\"C:\\x\\ArmaReforgerSteam.exe\"") == "");
+    Check("-profile name: a folder in Documents\\My Games", Doctor.ProfileArg("-window -profile Alt", docs) == Path.Combine(docs, "My Games", "Alt", "profile"));
+    Check("-profile path: used as it is, plus profile", Doctor.ProfileArg("-profile \"G:\\Arma Profile\" -window", docs) == Path.Combine("G:\\Arma Profile", "profile"));
+    Check("-PROFILE is the same option", Doctor.ProfileArg("-PROFILE G:\\P", docs) == Path.Combine("G:\\P", "profile"));
+    Check("no -profile", Doctor.ProfileArg("-window -noSplash", docs) == null && Doctor.ProfileArg(null, docs) == null && Doctor.ProfileArg("-profile", docs) == null);
+    Check("-profile followed by another option is ignored", Doctor.ProfileArg("-profile -window", docs) == null);
+    Check("-profile with forward slashes", Doctor.ProfileArg("-profile G:/Arma/Moved", docs) == Path.Combine("G:\\Arma\\Moved", "profile"));
+    Check("-profile on a network share", Doctor.ProfileArg("-profile \\\\nas\\arma", docs) == Path.Combine("\\\\nas\\arma", "profile"));
+    Check("-profile relative: from the game's folder", Doctor.ProfileArg("-profile ..\\Profiles", docs, "D:\\Steam\\steamapps\\common\\Arma Reforger") == Path.Combine("D:\\Steam\\steamapps\\common\\Profiles", "profile"));
+    Check("-profile relative, game folder unknown: can't tell", Doctor.ProfileArg("-profile ..\\Profiles", docs) == null && Doctor.ProfileArg("-profile Arma\\P", docs) == null);
+    Check("-profile with %command% (Steam's form)", Doctor.ProfileArg("%command% -profile \"G:\\Arma Reforger\"", docs) == Path.Combine("G:\\Arma Reforger", "profile"));
+    var a = Doctor.SplitArgs("-a \"b c\" d  \"\"");
+    Check("arguments split with quotes", a.Count == 4 && a[1] == "b c" && a[2] == "d" && a[3] == "");
+  }
+
+  static void SteamOptions() {
+    const string vdf = "\"UserLocalConfigStore\"\n{\n\t\"Software\"\n\t{\n\t\t\"Valve\"\n\t\t{\n\t\t\t\"Steam\"\n\t\t\t{\n\t\t\t\t\"apps\"\n\t\t\t\t{\n" +
+      "\t\t\t\t\t\"1874880\"\n\t\t\t\t\t{\n\t\t\t\t\t\t\"LastPlayed\"\t\t\"1792800000\"\n\t\t\t\t\t\t\"cloud\"\n\t\t\t\t\t\t{\n\t\t\t\t\t\t\t\"LaunchOptions\"\t\t\"not this one\"\n\t\t\t\t\t\t}\n" +
+      "\t\t\t\t\t\t\"LaunchOptions\"\t\t\"-profile \\\"G:\\\\Arma {Profile}\\\" -window\"\n\t\t\t\t\t}\n" +
+      "\t\t\t\t\t\"107410\"\n\t\t\t\t\t{\n\t\t\t\t\t\t\"LaunchOptions\"\t\t\"-arma3\"\n\t\t\t\t\t}\n\t\t\t\t}\n\t\t\t}\n\t\t}\n\t}\n\t// a comment \"1874880\" {\n}\n";
+    var o = SteamConfig.LaunchOptions(vdf, 1874880);
+    Check("steam: Reforger's launch options read, escapes undone", o.Count == 1 && o[0] == "-profile \"G:\\Arma {Profile}\" -window");
+    Check("steam: another game's options aren't Reforger's", SteamConfig.LaunchOptions(vdf, 107410).Count == 1 && SteamConfig.LaunchOptions(vdf, 107410)[0] == "-arma3");
+    Check("steam: the -profile in them is found", Doctor.ProfileArg(o[0], "D:\\Docs") == Path.Combine("G:\\Arma {Profile}", "profile"));
+    Check("steam: nothing for a game without options", SteamConfig.LaunchOptions(vdf, 42).Count == 0 && SteamConfig.LaunchOptions("", 1874880).Count == 0);
+
+    var reg = new Dictionary<string, string>();
+    var env = Sandbox("steam", reg);
+    string steam = Path.Combine(root, "steam", "Steam");
+    Directory.CreateDirectory(Path.Combine(steam, "userdata", "123", "config"));
+    Directory.CreateDirectory(Path.Combine(steam, "userdata", "456"));
+    File.WriteAllText(Path.Combine(steam, "userdata", "123", "config", "localconfig.vdf"), vdf);
+    reg[@"HKCU|Software\Valve\Steam|SteamPath"] = steam.Replace('\\', '/');
+    var pc = SteamConfig.LaunchOptionsOnPc(env, 1874880);
+    Check("steam: found through the registry, accounts without a config skipped", pc.Count == 1 && pc[0].StartsWith("-profile"));
+    string moved = Path.Combine("G:\\Arma {Profile}", "profile");
+    Check("steam: Steam not running, one account: its -profile", SteamConfig.LaunchProfile(env, 1874880) == moved);
+    reg[@"HKCU|Software\Valve\Steam\ActiveProcess|ActiveUser"] = "456";
+    Check("steam: the signed-in account has no options: the default folder", SteamConfig.LaunchProfile(env, 1874880) == null);
+    reg[@"HKCU|Software\Valve\Steam\ActiveProcess|ActiveUser"] = "123";
+    Check("steam: the signed-in account's -profile", SteamConfig.LaunchProfile(env, 1874880) == moved);
+    reg[@"HKCU|Software\Valve\Steam\ActiveProcess|ActiveUser"] = "0";
+    Directory.CreateDirectory(Path.Combine(steam, "userdata", "456", "config"));
+    File.WriteAllText(Path.Combine(steam, "userdata", "456", "config", "localconfig.vdf"), vdf.Replace("Arma {Profile}", "Other"));
+    Check("steam: Steam signed out, accounts disagree: can't tell", SteamConfig.LaunchProfile(env, 1874880) == null);
+    File.WriteAllText(Path.Combine(steam, "userdata", "456", "config", "localconfig.vdf"), vdf);
+    Check("steam: Steam signed out, accounts agree", SteamConfig.LaunchProfile(env, 1874880) == moved);
+  }
+
+  // A window that turns every offer down ("NOT NOW"), so a check can run RADIO CHECK start to finish without a fix ever
+  // running: no installer, no closing TeamSpeak. A question without that choice goes unanswered (null: window closed).
+  // Never answer a RADIO CHECK question with its first choice: that is UPDATE TEAMSPEAK or INSTALL IT THERE.
+  class NoThanks : IConsole {
+    public readonly List<string> Lines = new List<string>(), Questions = new List<string>();
+    public void Line(string text, Tone tone) { Lines.Add(text); }
+    public void Progress(string label, long got, long total, double rate) { }
+    public string Ask(string question, params string[] choices) { Questions.Add(question); return Array.IndexOf(choices, "NOT NOW") >= 0 ? "NOT NOW" : null; }
+    public string Input(string prompt, string current, Func<string, string> problem, int maxLength) { return null; }
+    public void Restart(string exe, string args) { }
+    public void Changed() { }
+  }
+
+  // LAUNCH, before it starts anything: Steam's -profile gets linked.
+  static void LaunchLink() {
+    if (Environment.OSVersion.Platform != PlatformID.Win32NT) { Console.WriteLine("  (launch link checks skipped: not Windows)"); return; }
+    if (TeamSpeak.Running().Length > 0) { Console.WriteLine("  (launch link checks skipped: TeamSpeak is running, and a link closes it)"); return; }
+
+    var reg = new Dictionary<string, string>();
+    var env = Sandbox("launch", reg);
+    string steam = Path.Combine(root, "launch", "Steam");
+    string moved = Path.Combine(root, "launch", "G", "Arma Moved");
+    Directory.CreateDirectory(Path.Combine(steam, "userdata", "77", "config"));
+    File.WriteAllText(Path.Combine(steam, "userdata", "77", "config", "localconfig.vdf"),
+      "\"UserLocalConfigStore\" { \"apps\" { \"1874880\" { \"LaunchOptions\" \"-profile \\\"" + moved.Replace("\\", "\\\\") + "\\\" -window\" } } }");
+    reg[@"HKCU|Software\Valve\Steam|SteamPath"] = steam;
+    reg[@"HKCU|Software\Valve\Steam\ActiveProcess|ActiveUser"] = "77";
+    Directory.CreateDirectory(env.ProfileDir);
+    File.WriteAllText(Path.Combine(env.ProfileDir, "VONPluginInfo.json"), "old plugin file");
+
+    // the only answers given are NOT NOW, then the exact link choice
+    var no = new FakeConsole();
+    no.Answers.Enqueue("NOT NOW");
+    var c = new Comms(env, env.HomeExe, "1.0.0") { Out = no };
+    c.M.GameProcess = "BifrostCommsTestsNoGame";   // a Reforger running on this PC (a test instance, say) isn't this check's game
+    c.LinkProfileBeforeLaunch();
+    Check("launch: asks about Steam's -profile", no.Prompts.Count == 1 && no.Lines.Exists(l => l.Contains("-profile") && l.Contains("Arma Moved")));
+    Check("launch: NOT NOW links nothing", !Doctor.IsLink(env.ProfileDir) && !Directory.Exists(moved));
+
+    var yes = new FakeConsole();
+    yes.Answers.Enqueue("LINK THE FOLDERS");
+    c.Out = yes;
+    c.LinkProfileBeforeLaunch();
+    string game = Path.Combine(moved, "profile");
+    Check("launch: LINK makes the folder Reforger will use and links the plugin's to it", Doctor.IsLink(env.ProfileDir) && Doctor.SameDir(env.ProfileDir, game));
+    Check("launch: the plugin's old folder is kept", File.ReadAllText(Path.Combine(env.ProfileDir + ".bifrost-old", "VONPluginInfo.json")) == "old plugin file");
+    File.WriteAllText(Path.Combine(env.ProfileDir, "VONPluginInfo.json"), "{}");
+    Check("launch: what the plugin writes lands where the game reads", File.Exists(Path.Combine(game, "VONPluginInfo.json")));
+    c.LinkProfileBeforeLaunch();
+    Check("launch: linked already: no question", yes.Prompts.Count == 1);
+
+    var plain = Sandbox("launch-plain", null);
+    var none = new FakeConsole();
+    var c2 = new Comms(plain, plain.HomeExe, "1.0.0") { Out = none };
+    c2.M.GameProcess = "BifrostCommsTestsNoGame";
+    c2.LinkProfileBeforeLaunch();
+    Check("launch: no -profile: no question", none.Prompts.Count == 0 && none.Lines.Count == 0);
+  }
+
+  // a unit with a server, as comms.json gives it
+  static Manifest UnitManifest() {
+    var m = Manifest.BuiltIn();
+    m.Host = "203.0.113.10"; m.Port = 9987; m.ServerName = "Example Unit";
+    return m;
+  }
+
+  static Facts Healthy(string profile) {
+    var tabs = new List<TsConnection> { new TsConnection { Handler = 1, Ip = "203.0.113.10", Port = 9987, ChannelPath = "EXU/Reforger In-Game (VON Test)", Active = true } };
+    return new Facts { ProfileDir = profile, TsInstalled = true, TsRunning = true, PluginInstalled = true, PluginFresh = true, TsVersion = "3.6.2",
+      TsDir = Path.Combine(root, "ts"), RunningTsDir = Path.Combine(root, "ts"), GameRunning = true, HeartbeatAge = 0.4, Tabs = tabs,
+      Sd = new ServerData { InGame = true, ClientId = 22, ChannelName = "Reforger In-Game (VON Test)" } };
+  }
+
+  static Fix Only(List<Finding> found) { return found.Count == 1 ? found[0].Fix : (Fix)(-1); }
+
+  static void Diagnoses() {
+    var m = UnitManifest();
+    string profile = Path.Combine(root, "diag", "Documents", "My Games", "ArmaReforger", "profile");
+    Directory.CreateDirectory(profile);
+    Check("diagnose: all good = nothing to report", Doctor.Diagnose(Healthy(profile), m).Count == 0);
+
+    var f = Healthy(profile); f.TsInstalled = false;
+    Check("diagnose: no TeamSpeak", Doctor.Diagnose(f, m).Count == 1 && Doctor.Diagnose(f, m)[0].Problem.Contains("isn't installed"));
+    f = Healthy(profile); f.TsVersion = "3.5.6"; f.PluginFresh = false;
+    var found = Doctor.Diagnose(f, m);
+    Check("diagnose: TeamSpeak 3.5 is too old (API 26 needs 3.6)", found.Count >= 1 && found[0].Fix == Fix.UpdateTeamSpeak && !found.Exists(x => x.Fix == Fix.RestartTeamSpeak));
+    f = Healthy(profile); f.PluginInstalled = false; f.PluginFresh = false;
+    Check("diagnose: plugin not installed: SET UP", Doctor.Diagnose(f, m).Count == 1 && Doctor.Diagnose(f, m)[0].Advice.Contains("SET UP") && Doctor.Diagnose(f, m)[0].Fix == Fix.None);
+    f = Healthy(profile); f.RunningTsDir = Path.Combine(root, "portable-ts"); f.PluginFresh = false;
+    found = Doctor.Diagnose(f, m);
+    Check("diagnose: a different TeamSpeak is running", found.Count >= 1 && found[0].Fix == Fix.PluginIntoRunningTs && found[0].Target == f.RunningTsDir);
+    f = Healthy(profile); f.PluginFresh = false; f.RuntimeMissing = true;
+    Check("diagnose: plugin not loaded, Visual C++ runtime missing", Doctor.Diagnose(f, m).Count >= 1 && Doctor.Diagnose(f, m)[0].Fix == Fix.VcRuntime);
+    f = Healthy(profile); f.PluginFresh = false; f.GameRunning = false;
+    Check("diagnose: plugin not loaded, runtime there: restart TeamSpeak", Only(Doctor.Diagnose(f, m)) == Fix.RestartTeamSpeak);
+
+    // the moved-profile case: the plugin works, the game keeps its radio files elsewhere
+    f = Healthy(profile); f.HeartbeatAge = -1; f.Sd = null; f.GameProfileDir = Path.Combine(root, "G", "ArmaProfile", "profile");
+    found = Doctor.Diagnose(f, m);
+    Check("diagnose: -profile elsewhere: link the folders", Only(found) == Fix.LinkProfile && found[0].Target == f.GameProfileDir && found[0].Problem.Contains("-profile"));
+    f = Healthy(profile); f.HeartbeatAge = -1; f.Sd = null; f.GameProfileDir = profile;
+    Check("diagnose: -profile at the plugin's own folder is fine", Doctor.Diagnose(f, m).Count == 1 && Doctor.Diagnose(f, m)[0].Tone == Tone.Accent);
+    f = Healthy(profile); f.HeartbeatAge = 600; f.ElsewhereDir = Path.Combine(root, "OneDrive", "My Games", "ArmaReforger", "profile");
+    found = Doctor.Diagnose(f, m);
+    Check("diagnose: the game's heartbeat in another folder: link to it", Only(found) == Fix.LinkProfile && found[0].Target == f.ElsewhereDir);
+    f = Healthy(profile); f.HeartbeatAge = -1; f.Sd = null; f.FolderAccessOn = true;
+    Check("diagnose: no signal with Controlled folder access on", Only(Doctor.Diagnose(f, m)) == Fix.FolderAccess);
+    f = Healthy(profile); f.HeartbeatAge = -1; f.Sd = null;
+    found = Doctor.Diagnose(f, m);
+    Check("diagnose: no signal, nothing wrong: a hint to join and spawn", found.Count == 1 && found[0].Tone == Tone.Accent && found[0].Fix == Fix.None && found[0].Advice.Contains("Coalition radio server"));
+    f = Healthy(profile); f.Sd = new ServerData { InGame = false };
+    found = Doctor.Diagnose(f, m);
+    Check("diagnose: on a radio server, not spawned: a hint", found.Count == 1 && found[0].Tone == Tone.Accent && found[0].Problem.Contains("spawned"));
+
+    // in game: TeamSpeak's side
+    f = Healthy(profile); f.Tabs = new List<TsConnection> { new TsConnection { Handler = 1, Ip = "10.0.0.5", Port = 9987, Active = true } };
+    found = Doctor.Diagnose(f, m);
+    Check("diagnose: TeamSpeak not on the unit's server: connect", Only(found) == Fix.Connect && found[0].Problem.Contains("Example Unit"));
+    f = Healthy(profile); f.Tabs[0].Active = false; f.Tabs.Add(new TsConnection { Handler = 2, Ip = "10.0.0.5", Port = 9987, Active = true });
+    found = Doctor.Diagnose(f, m);
+    Check("diagnose: the unit's tab isn't the selected one", found.Count == 1 && found[0].Problem.Contains("selected tab") && found[0].Fix == Fix.None);
+    f = Healthy(profile); f.Tabs = null; f.Sd.ClientId = 0;
+    Check("diagnose: the plugin sees no TeamSpeak connection", Doctor.Diagnose(f, m).Count == 1 && Doctor.Diagnose(f, m)[0].Problem.Contains("Not Detected"));
+    f = Healthy(profile); f.Tabs[0].ChannelPath = "EXU/Lobby";
+    Check("diagnose: not moved into the radio channel", Doctor.Diagnose(f, m).Count == 1 && Doctor.Diagnose(f, m)[0].Problem.Contains("hasn't moved you")
+      && Doctor.Diagnose(f, m)[0].Advice.Contains("your unit's admins"));
+    f = Healthy(profile); f.Tabs.Add(new TsConnection { Handler = 2, Ip = "10.0.0.5", Port = 9987 });
+    Check("diagnose: a second tab is fine while the unit's is selected", Doctor.Diagnose(f, m).Count == 0);
+
+    // comms.json may name the server instead of giving its address: the program's own lookup decides which tab is the unit's
+    f = Healthy(profile); f.Tabs[0].Ip = "198.51.100.9"; f.IsUnitServer = delegate(TsConnection t) { return t.Ip == "198.51.100.9"; };
+    Check("diagnose: a tab the program says is the unit's counts, whatever its address", Doctor.Diagnose(f, m).Count == 0);
+    f = Healthy(profile); f.IsUnitServer = delegate(TsConnection t) { return false; };
+    Check("diagnose: no tab is the unit's: connect", Only(Doctor.Diagnose(f, m)) == Fix.Connect);
+
+    // no server set at all (no comms.json, nothing typed in): there is no "the unit's tab" to get wrong
+    var unset = UnitManifest(); unset.Host = null; unset.ServerName = null;
+    f = Healthy(profile); f.Tabs = new List<TsConnection> { new TsConnection { Handler = 1, Ip = "10.0.0.5", Port = 9987, Active = true } };
+    Check("diagnose: no server set: the TeamSpeak tab can't be the wrong one", Doctor.Diagnose(f, unset).Count == 0);
+    f = Healthy(profile); f.Sd.ClientId = 0;
+    found = Doctor.Diagnose(f, unset);
+    Check("diagnose: no server set: the plugin seeing no connection is still said", found.Count == 1 && found[0].Problem.Contains("Not Detected") && !found[0].Advice.Contains("Example"));
+    Check("report: no server set is said", Doctor.Report(f, unset).Exists(x => x.Key.Contains("not set")));
+
+    var every = Healthy(profile); every.GameOptions = "-window"; every.LaunchOptions.Add("-window");
+    var report = Doctor.Report(every, m);
+    Check("report: lists the folder, the game and the tabs", report.Exists(x => x.Key.StartsWith("radio files folder")) && report.Exists(x => x.Key.Contains("options '-window'")) && report.Exists(x => x.Key.Contains("<- selected")));
+    Check("report: the unit's tab is named", report.Exists(x => x.Key.Contains("(Example Unit)")));
+  }
+
+  // RADIO CHECK start to finish on a sandbox PC, with a window that declines every offer.
+  static void RadioCheckRun() {
+    var env = Sandbox("rc", null);
+    var no = new NoThanks();
+    var c = new Comms(env, env.HomeExe, "1.0.0") { Out = no };
+    c.M.GameProcess = "BifrostCommsTestsNoGame";
+    c.RadioCheck(null);
+    Check("radio check: the button prints what it looked at", no.Lines.Contains("=== RADIO CHECK ===") && no.Lines.Exists(l => l.StartsWith("radio files folder: " + env.ProfileDir)));
+    Check("radio check: no TeamSpeak is a problem with nothing to press", no.Lines.Exists(l => l.StartsWith("PROBLEM: TeamSpeak 3 isn't installed")) && no.Questions.Count == 0);
+    Check("radio check: it sums up, pointing at the unit's admins", no.Lines.Exists(l => l.StartsWith("radio check: 1 problem, 0 fixed") && l.Contains("your unit's admins")));
+
+    var auto = new NoThanks();
+    c.Out = auto;
+    c.RadioCheck("no radio signal from the game");
+    Check("radio check: the automatic run says why and prints only what's wrong", auto.Lines.Contains("=== RADIO CHECK: no radio signal from the game ===")
+      && !auto.Lines.Exists(l => l.StartsWith("radio files folder")) && auto.Lines.Exists(l => l.StartsWith("PROBLEM:")));
+
+    if (Environment.OSVersion.Platform != PlatformID.Win32NT) return;
+    if (TeamSpeak.Running().Length > 0) { Console.WriteLine("  (radio check with an old TeamSpeak skipped: TeamSpeak is running)"); return; }
+    // an old TeamSpeak 3 (a file that isn't a program reads as version 0): the offer to update comes up and NOT NOW leaves it be
+    string tsDir = Path.Combine(env.ProgramFiles, "TeamSpeak 3 Client");
+    Directory.CreateDirectory(tsDir);
+    File.WriteAllBytes(Path.Combine(tsDir, "ts3client_win64.exe"), new byte[] { 0x4d, 0x5a });
+    var offer = new NoThanks();
+    c.Out = offer;
+    c.RadioCheck(null);
+    Check("radio check: an old TeamSpeak is offered an update", offer.Questions.Count == 1 && offer.Questions[0].StartsWith("Update TeamSpeak to"));
+    Check("radio check: NOT NOW leaves it as it is", offer.Lines.Exists(l => l.StartsWith("left as it is")) && !Directory.Exists(env.Downloads)
+      && offer.Lines.Exists(l => l.StartsWith("radio check: 2 problems, 0 fixed")));
+  }
+
+  // The automatic RADIO CHECK: when the link stays stuck, once each time, with times the check hands in.
+  static void StuckWatch() {
+    var env = Sandbox("stuck", null);
+    var c = new Comms(env, env.HomeExe, "1.0.0");
+    var t0 = new DateTime(2026, 10, 28, 20, 0, 0);
+    Func<Link, LinkState> state = delegate(Link l) { return new LinkState { Link = l }; };
+
+    c.WatchForStuck(state(Link.NoPlugin), true, false, false, false, t0);
+    c.WatchForStuck(state(Link.NoPlugin), true, false, false, false, t0.AddSeconds(40));
+    Check("stuck: plugin not loaded for 40 s: not yet", c.TakePendingCheck() == null);
+    c.WatchForStuck(state(Link.NoPlugin), true, false, false, false, t0.AddSeconds(50));
+    Check("stuck: plugin not loaded for 50 s: RADIO CHECK is due", c.TakePendingCheck() == "the radio plugin isn't loaded");
+    c.WatchForStuck(state(Link.NoPlugin), true, false, false, false, t0.AddSeconds(500));
+    Check("stuck: it runs once for one stuck spell", c.TakePendingCheck() == null);
+    c.WatchForStuck(state(Link.Linked), true, true, true, false, t0.AddSeconds(510));
+    c.WatchForStuck(state(Link.Joining), true, true, true, false, t0.AddSeconds(520));
+    c.WatchForStuck(state(Link.Joining), true, true, true, false, t0.AddSeconds(555));
+    Check("stuck: stuck again after a good spell: it runs again", c.TakePendingCheck() == "teamspeak hasn't linked the radio");
+
+    c.WatchForStuck(state(Link.Off), false, false, false, false, t0.AddSeconds(600));
+    c.WatchForStuck(state(Link.Standby), true, true, true, false, t0.AddSeconds(610));
+    c.WatchForStuck(state(Link.Standby), true, true, true, false, t0.AddSeconds(610 + 140));
+    Check("stuck: on a radio server, not spawned for 140 s: not yet", c.TakePendingCheck() == null);
+    c.WatchForStuck(state(Link.Standby), true, true, true, false, t0.AddSeconds(610 + 155));
+    Check("stuck: on a radio server, not spawned for 155 s: due", c.TakePendingCheck() == "you haven't spawned in");
+    c.WatchForStuck(state(Link.Standby), true, true, false, false, t0.AddSeconds(900));
+    c.WatchForStuck(state(Link.Standby), true, true, false, false, t0.AddSeconds(900 + 170));
+    Check("stuck: no game signal for 170 s: not yet", c.TakePendingCheck() == null);
+    c.WatchForStuck(state(Link.Standby), true, true, false, false, t0.AddSeconds(900 + 185));
+    Check("stuck: no game signal for 185 s: due", c.TakePendingCheck() == "no radio signal from the game");
+
+    c.WatchForStuck(state(Link.Off), false, false, false, false, t0.AddSeconds(1200));
+    c.WatchForStuck(state(Link.Split), true, true, false, false, t0.AddSeconds(1210));
+    c.WatchForStuck(state(Link.Split), true, true, false, false, t0.AddSeconds(1212));
+    Check("stuck: a moved profile folder doesn't wait", c.TakePendingCheck() == "Reforger keeps its radio files in another folder");
+    c.WatchForStuck(state(Link.Off), false, false, false, false, t0.AddSeconds(1300));
+    c.WatchForStuck(state(Link.Split), true, true, false, true, t0.AddSeconds(1310));
+    c.WatchForStuck(state(Link.Split), true, true, false, true, t0.AddSeconds(1320));
+    Check("stuck: a moved profile folder LAUNCH already asked about stays quiet", c.TakePendingCheck() == null);
+    c.WatchForStuck(state(Link.Off), false, false, false, false, t0.AddSeconds(1400));
+    c.WatchForStuck(state(Link.Off), false, false, false, false, t0.AddSeconds(5000));
+    Check("stuck: the game being off is never stuck", c.TakePendingCheck() == null);
+  }
+
+  static void PcChecks() {
+    var env = Sandbox("pc", null);
+    env.SystemDir = Path.Combine(root, "pc", "Windows", "System32");
+    Directory.CreateDirectory(env.SystemDir);
+    string tsDir = Path.Combine(env.ProgramFiles, "TeamSpeak 3 Client");
+    Directory.CreateDirectory(tsDir);
+    Check("runtime: missing from Windows and TeamSpeak", Doctor.RuntimeMissing(env, tsDir));
+    File.WriteAllText(Path.Combine(tsDir, "vcruntime140.dll"), "MZ");
+    Check("runtime: beside TeamSpeak counts", !Doctor.RuntimeMissing(env, tsDir));
+    File.WriteAllText(Path.Combine(env.SystemDir, "vcruntime140.dll"), "MZ");
+    Check("runtime: installed in Windows", !Doctor.RuntimeMissing(env, null));
+    env.SystemDir = null;
+    Check("runtime: unknown Windows folder isn't reported missing", !Doctor.RuntimeMissing(env, null));
+
+    // the game's heartbeat in a folder the plugin doesn't read
+    Directory.CreateDirectory(env.ProfileDir);
+    File.WriteAllText(Path.Combine(env.ProfileDir, "VONHeartbeat.json"), "{}");
+    Check("elsewhere: the plugin's own folder doesn't count", Doctor.HeartbeatElsewhere(env, null) == null);
+    string other = Path.Combine(root, "pc", "OneDrive", "Documents");
+    string otherProfile = Path.Combine(other, "My Games", "ArmaReforger", "profile");
+    Directory.CreateDirectory(otherProfile);
+    File.WriteAllText(Path.Combine(otherProfile, "VONHeartbeat.json"), "{}");
+    File.SetLastWriteTimeUtc(Path.Combine(otherProfile, "VONHeartbeat.json"), DateTime.UtcNow.AddMinutes(-5));
+    env.OtherDocuments = new[] { other };
+    string workbench = Path.Combine(env.Documents, "My Games", "ArmaReforgerWorkbench", "profile");
+    Directory.CreateDirectory(workbench);
+    File.WriteAllText(Path.Combine(workbench, "VONHeartbeat.json"), "{}");
+    Check("elsewhere: a Workbench test run isn't the game", Doctor.HeartbeatElsewhere(env, null) == null);
+    Check("elsewhere: an old heartbeat isn't the game", Doctor.HeartbeatElsewhere(env, null) == null);
+    File.SetLastWriteTimeUtc(Path.Combine(otherProfile, "VONHeartbeat.json"), DateTime.UtcNow);
+    Check("elsewhere: a fresh heartbeat in OneDrive's Documents", Doctor.HeartbeatElsewhere(env, null) == otherProfile);
+    string custom = Path.Combine(root, "pc", "G", "ArmaProfile", "profile");
+    Directory.CreateDirectory(custom);
+    File.WriteAllText(Path.Combine(custom, "VONHeartbeat.json"), "{}");
+    Check("elsewhere: the -profile folder comes first", Doctor.HeartbeatElsewhere(env, custom) == custom);
+
+    // the running TeamSpeak's own install: registry, or a portable config folder
+    var reg = new Dictionary<string, string>();
+    var env2 = Sandbox("atdir", reg);
+    string portable = Path.Combine(root, "atdir", "TS3Portable");
+    Directory.CreateDirectory(Path.Combine(portable, "config"));
+    File.WriteAllBytes(Path.Combine(portable, "ts3client_win64.exe"), new byte[] { 0x4d, 0x5a });
+    File.WriteAllText(Path.Combine(portable, "config", "settings.db"), "");
+    var t = TeamSpeak.AtDir(env2, portable);
+    Check("AtDir: a portable copy keeps its plugins beside it", t != null && t.ConfigInInstallDir && t.PluginsDir == Path.Combine(portable, "config", "plugins"));
+    reg[@"HKCU|Software\TeamSpeak 3 Client|"] = portable;
+    reg[@"HKCU|Software\TeamSpeak 3 Client|ConfigLocation"] = "0";
+    t = TeamSpeak.AtDir(env2, portable + "\\");
+    Check("AtDir: the registry's choice wins for its own folder", t != null && !t.ConfigInInstallDir);
+    Check("AtDir: no client there", TeamSpeak.AtDir(env2, Path.Combine(root, "atdir", "nothing")) == null);
+  }
+
+  static void FolderLink() {
+    if (Environment.OSVersion.Platform != PlatformID.Win32NT) { Console.WriteLine("  (folder link checks skipped: not Windows)"); return; }
+    string pc = Path.Combine(root, "link");
+    string plugin = Path.Combine(pc, "Documents", "My Games", "ArmaReforger", "profile");
+    string game = Path.Combine(pc, "G", "Arma Profile", "profile");
+    Directory.CreateDirectory(plugin);
+    Directory.CreateDirectory(game);
+    File.WriteAllText(Path.Combine(plugin, "VONPluginInfo.json"), "old plugin file");
+    File.WriteAllText(Path.Combine(game, "VONHeartbeat.json"), "{}");
+    Check("link: different folders before", !Doctor.SameDir(plugin, game));
+    Throws<IOException>("link: a missing game folder is refused", delegate { Doctor.LinkFolders(plugin, Path.Combine(pc, "nowhere")); });
+    Check("link: a refused link moves nothing", File.Exists(Path.Combine(plugin, "VONPluginInfo.json")) && !Doctor.IsLink(plugin));
+    string aside = Doctor.LinkFolders(plugin, game);
+    Check("link: the plugin's folder now opens the game's", Doctor.IsLink(plugin) && Doctor.SameDir(plugin, game) && File.Exists(Path.Combine(plugin, "VONHeartbeat.json")));
+    Check("link: the old folder is kept beside it", aside == plugin + ".bifrost-old" && File.ReadAllText(Path.Combine(aside, "VONPluginInfo.json")) == "old plugin file");
+    File.WriteAllText(Path.Combine(plugin, "VONServerData.json"), "{}");
+    Check("link: what the plugin writes lands in the game's folder", File.Exists(Path.Combine(game, "VONServerData.json")));
+    Check("link: the plugin reads the game's heartbeat through it", new Bridge(plugin).HeartbeatAge(DateTime.UtcNow) >= 0);
+    Check("link: linking again changes nothing", Doctor.LinkFolders(plugin, game) == null && Doctor.SameDir(plugin, game));
+    string game2 = Path.Combine(pc, "H", "profile");
+    Directory.CreateDirectory(game2);
+    string aside2 = Doctor.LinkFolders(plugin, game2);
+    Check("link: an old link moves aside as a link, the game's files stay", aside2 == plugin + ".bifrost-old-2" && Doctor.SameDir(plugin, game2) && File.Exists(Path.Combine(game, "VONHeartbeat.json")));
+    Directory.Delete(aside2, false);   // the junction only
+    Check("link: removing a link leaves the folder it opened", File.Exists(Path.Combine(game, "VONServerData.json")));
+  }
+
   // ---------------------------------------------------------------------------------------------- pictures
 
   // the pictures show this build's version
@@ -654,7 +1034,7 @@ static class CommsTests {
       c2.St.Plugin = "3.0.1  LOADED"; c2.St.PluginDetail = "talking to TeamSpeak"; c2.St.PluginTone = Tone.Ok;
       c2.St.TsLink = "CONNECTED"; c2.St.TsLinkDetail = "Reforger In-Game (VON)"; c2.St.TsLinkTone = Tone.Ok;
       c2.St.Game = "RUNNING"; c2.St.GameTone = Tone.Ok;
-      c2.St.Link = Bridge.Derive(true, true, true, new ServerData { InGame = true, ChannelName = "Reforger In-Game (VON)" }, 0.5, "EXU/Reforger In-Game (VON)");
+      c2.St.Link = Bridge.Derive(true, true, true, new ServerData { InGame = true, ChannelName = "Reforger In-Game (VON)", ClientId = 7 }, 0.5, "EXU/Reforger In-Game (VON)");
       c2.St.Updates = "UP TO DATE"; c2.St.UpdatesDetail = "Bifrost Comms " + Shown; c2.St.UpdatesTone = Tone.Ok;
     }
     f2.Line("=== LAUNCH: REFORGER + RADIO ===", Tone.Accent);
@@ -668,6 +1048,51 @@ static class CommsTests {
     form = f2; c = c2;
     shot("4-linked");
     f2.Close();
-    Check("renders written", File.Exists(Path.Combine(dir, "4-linked.png")) && File.Exists(Path.Combine(dir, "0-server-address.png")));
+
+    // a moved profile folder: the game is down for the radio, RADIO CHECK finds the -profile folder and offers to link it
+    var env3 = Sandbox("renders3", null);
+    Directory.CreateDirectory(env3.Home);
+    File.WriteAllText(env3.HomeUnit, "{\"name\":\"Example Unit\",\"host\":\"ts.example.com\",\"port\":9987}");
+    var c3 = new Comms(env3, env3.HomeExe, Shown);
+    var f3 = new TerminalForm(c3, false) { UiScale = 1f };
+    c3.Settings.Callsign = "PFC J. Doe";
+    lock (c3.Lock) {
+      c3.St.Uplink = "LOCAL"; c3.St.UplinkDetail = "built-in pins (no unit manifest)"; c3.St.UplinkTone = Tone.Ok;
+      c3.St.Ts = "3.6.2  RUNNING"; c3.St.TsDetail = "installed for you"; c3.St.TsTone = Tone.Ok;
+      c3.St.Plugin = "3.0.1  LOADED"; c3.St.PluginDetail = "talking to TeamSpeak"; c3.St.PluginTone = Tone.Ok;
+      c3.St.TsLink = "CONNECTED"; c3.St.TsLinkDetail = "Lobby"; c3.St.TsLinkTone = Tone.Ok;
+      c3.St.Game = "RUNNING"; c3.St.GameTone = Tone.Ok;
+      c3.St.Link = Bridge.Derive(true, true, true, null, -1, "EXU/Lobby", false, "G:\\Arma\\profile");
+      c3.St.Updates = "UP TO DATE"; c3.St.UpdatesDetail = "Bifrost Comms " + Shown; c3.St.UpdatesTone = Tone.Ok;
+    }
+    f3.Line("arma reforger started", Tone.Ok);
+    f3.Line("radio link: " + c3.St.Link.Text + " - " + c3.St.Link.Detail, Tone.Bad);
+    f3.Line("=== RADIO CHECK: Reforger keeps its radio files in another folder ===", Tone.Accent);
+    f3.Line("PROBLEM: Reforger is started with -profile, so it keeps its radio files in G:\\Arma\\profile, but the Coalition plugin only looks in C:\\Users\\player\\Documents\\My Games\\ArmaReforger\\profile.", Tone.Bad);
+    f3.Line("  LINK THE FOLDERS makes the plugin's folder open Reforger's (your profile, settings and mods stay where they are).", Tone.Text);
+    var asking3 = new Thread(delegate() { f3.Ask("Link the plugin's folder to Reforger's profile folder?", "LINK THE FOLDERS", "NOT NOW"); }) { IsBackground = true };
+    asking3.Start();
+    Thread.Sleep(200);
+    form = f3; c = c3;
+    shot("5-radio-check");
+    f3.Close();   // answers the question
+    asking3.Join(2000);
+
+    f3 = new TerminalForm(c3, false) { UiScale = 1f };
+    lock (c3.Lock) {
+      c3.St.TsLinkDetail = "Reforger In-Game (VON)";
+      c3.St.Link = Bridge.Derive(true, true, true, new ServerData { InGame = true, ChannelName = "Reforger In-Game (VON)", ClientId = 22 }, 0.4, "EXU/Reforger In-Game (VON)");
+    }
+    f3.Line("> LINK THE FOLDERS", Tone.Dim);
+    f3.Line("linked: C:\\Users\\player\\Documents\\My Games\\ArmaReforger\\profile now opens G:\\Arma\\profile ........ OK", Tone.Ok);
+    f3.Line("the folder that was there is kept as C:\\Users\\player\\Documents\\My Games\\ArmaReforger\\profile.bifrost-old", Tone.Dim);
+    f3.Line("teamspeak: connecting to ts.example.com:9987 as PFC J. Doe", Tone.Ok);
+    f3.Line("radio check: 1 problem, 1 fixed. Watch the RADIO LINK light.", Tone.Ok);
+    f3.Line("radio link: LINKED - in game, in Reforger In-Game (VON)", Tone.Ok);
+    form = f3; c = c3;
+    shot("6-fixed");
+    f3.Close();
+    Check("renders written", File.Exists(Path.Combine(dir, "4-linked.png")) && File.Exists(Path.Combine(dir, "0-server-address.png"))
+      && File.Exists(Path.Combine(dir, "5-radio-check.png")) && File.Exists(Path.Combine(dir, "6-fixed.png")));
   }
 }
