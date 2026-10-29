@@ -4,14 +4,14 @@
 #   build/BifrostComms.exe   the program
 #   build/CommsTests.exe     the tests (mono build/CommsTests.exe; xvfb-run -a for the pictures)
 #   build/icons/             the icon
-# VERSION=1.2.0 ./build.sh sets the version (default 1.0.0).
+# VERSION=1.2.1 ./build.sh sets the version (default 1.2.0).
 set -euo pipefail
 cd "$(dirname "$0")"
-version="${VERSION:-1.0.0}"
+version="${VERSION:-1.2.0}"
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "VERSION must look like 1.0.0" >&2; exit 2; }
 mkdir -p build/tools build/icons
 refs=(-r:System.dll -r:System.Core.dll -r:System.Drawing.dll -r:System.Windows.Forms.dll -r:System.Web.Extensions.dll
-      -r:System.IO.Compression.dll -r:System.IO.Compression.FileSystem.dll)
+      -r:System.IO.Compression.dll -r:System.IO.Compression.FileSystem.dll -r:System.Management.dll)
 opts=(-nologo -optimize+ -langversion:5 -sdk:4.5 -warnaserror+ -nowarn:618)
 cat > build/Version.cs <<CS
 using System.Reflection;

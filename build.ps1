@@ -2,8 +2,8 @@
 #   build\BifrostComms.exe   the program (what players download)
 #   build\CommsTests.exe     the tests: .\build\CommsTests.exe (exit code 1 when a check fails; pictures in build\renders)
 #   build\icons\             the icon
-# -Version 1.2.0 sets the version (default 1.0.0). Works in Windows PowerShell 5.1 and PowerShell 7.
-param([string]$Version = "1.0.0")
+# -Version 1.2.1 sets the version (default 1.2.0). Works in Windows PowerShell 5.1 and PowerShell 7.
+param([string]$Version = "1.2.0")
 $ErrorActionPreference = "Stop"
 
 if ($Version -notmatch '^\d+\.\d+\.\d+$') { throw "Version must look like 1.0.0" }
@@ -15,7 +15,7 @@ $icons = Join-Path $build "icons"
 New-Item -ItemType Directory -Force $build, $icons, (Join-Path $build "tools") | Out-Null
 
 $refs = "System.dll", "System.Core.dll", "System.Drawing.dll", "System.Windows.Forms.dll", "System.Web.Extensions.dll",
-        "System.IO.Compression.dll", "System.IO.Compression.FileSystem.dll" | ForEach-Object { "/reference:" + (Join-Path $fw $_) }
+        "System.IO.Compression.dll", "System.IO.Compression.FileSystem.dll", "System.Management.dll" | ForEach-Object { "/reference:" + (Join-Path $fw $_) }
 
 function Compile([string]$target, [string]$file, [string[]]$sources, [string[]]$extra = @()) {
   $cscArgs = @("/nologo", "/optimize+", "/codepage:65001", "/target:$target", "/out:$file") + $refs + $extra + $sources

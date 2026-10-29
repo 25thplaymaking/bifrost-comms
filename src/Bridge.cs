@@ -16,7 +16,7 @@ class ServerData {
   public long ClientId;
 }
 
-enum Link { Off, NoTeamSpeak, NoPlugin, Standby, Joining, Linked, NoHeartbeat }
+enum Link { Off, Split, NoTeamSpeak, NoPlugin, Standby, Joining, Linked, NoHeartbeat, OffServer }
 
 class LinkState {
   public Link Link;
@@ -73,13 +73,25 @@ class Bridge {
   }
 
   // One line for the status rail from everything we can see.
-  //   channel: the channel TeamSpeak says we're in (ClientQuery), null when unknown
-  public static LinkState Derive(bool gameRunning, bool tsRunning, bool pluginFresh, ServerData sd, double heartbeatAge, string channel) {
+  //   heartbeatAge: the game beats every second while it's on a radio server, spawned or not (-1: never)
+  //   channel: the channel TeamSpeak says we're in on the unit's server (ClientQuery), null when unknown
+  //   offUnit: ClientQuery answered and TeamSpeak isn't on the unit's server at all
+  //   gameProfile: the folder the game keeps its radio files in when it isn't the plugin's (-profile), null when it is
+  public static LinkState Derive(bool gameRunning, bool tsRunning, bool pluginFresh, ServerData sd, double heartbeatAge, string channel, bool offUnit = false, string gameProfile = null) {
     if (!gameRunning) return new LinkState { Link = Link.Off, Text = "IDLE", Detail = "Reforger isn't running", Tone = Tone.Dim };
+    // Nothing the plugin reads can come from the game then, so this goes first: RADIO CHECK links the two folders.
+    if (gameProfile != null) return new LinkState { Link = Link.Split, Text = "DOWN", Detail = "Reforger keeps its radio files in " + gameProfile + ", not where the plugin looks", Tone = Tone.Bad };
     if (!tsRunning) return new LinkState { Link = Link.NoTeamSpeak, Text = "DOWN", Detail = "TeamSpeak isn't running", Tone = Tone.Bad };
     if (!pluginFresh) return new LinkState { Link = Link.NoPlugin, Text = "DOWN", Detail = "the Coalition plugin isn't loaded in TeamSpeak", Tone = Tone.Bad };
-    if (sd == null || !sd.InGame) return new LinkState { Link = Link.Standby, Text = "STANDBY", Detail = "waiting for you to join a Coalition radio server", Tone = Tone.Accent };
+    if (sd == null || !sd.InGame) {
+      if (heartbeatAge >= 0 && heartbeatAge <= 5) return new LinkState { Link = Link.Standby, Text = "STANDBY", Detail = "on a radio server: the radio links when you spawn", Tone = Tone.Accent };
+      return new LinkState { Link = Link.Standby, Text = "STANDBY", Detail = "waiting for you to join a Coalition radio server", Tone = Tone.Accent };
+    }
     if (heartbeatAge > 5) return new LinkState { Link = Link.NoHeartbeat, Text = "NO SIGNAL", Detail = "the game stopped its heartbeat (frozen or crashed?)", Tone = Tone.Warn };
+    if (offUnit) return new LinkState { Link = Link.OffServer, Text = "NO TS SERVER", Detail = "TeamSpeak isn't on your unit's server: the plugin asks to connect", Tone = Tone.Warn };
+    // The plugin writes its TeamSpeak client id a moment after the game says it's in; still 0 means it can't see a
+    // connection on TeamSpeak's selected tab (the game shows "Teamspeak Plugin Not Detected").
+    if (sd.ClientId == 0) return new LinkState { Link = Link.Joining, Text = "JOINING", Detail = "waiting for the plugin to see your TeamSpeak connection", Tone = Tone.Warn };
     if (channel != null && !string.IsNullOrEmpty(sd.ChannelName) && TeamSpeak.ChannelName(channel) == sd.ChannelName)
       return new LinkState { Link = Link.Linked, Text = "LINKED", Detail = "in game, in " + sd.ChannelName, Tone = Tone.Ok };
     if (channel == null) return new LinkState { Link = Link.Linked, Text = "LINKED", Detail = "in game, radio running", Tone = Tone.Ok };
